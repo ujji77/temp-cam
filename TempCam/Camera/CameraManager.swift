@@ -44,6 +44,8 @@ final class CameraManager {
     private(set) var recordingDuration: TimeInterval = 0
     private(set) var isTorchAvailable = false
     private(set) var isTorchOn = false
+    /// Screen edge light used as the flash on the front camera, which has no torch.
+    private(set) var isFrontFlashOn = false
     private(set) var zoomStops: [ZoomStop] = []
     private(set) var displayZoom: CGFloat = 1
     private(set) var configurationGeneration = 0
@@ -139,7 +141,21 @@ final class CameraManager {
         if isTorchOn {
             isTorchOn = false
         }
+        isFrontFlashOn = false
         pipeline.switchCamera()
+    }
+
+    /// Front camera: the screen light. Rear camera: the LED torch when the device has one.
+    var isFlashAvailable: Bool { usesFrontCamera || isTorchAvailable }
+    var isFlashOn: Bool { usesFrontCamera ? isFrontFlashOn : isTorchOn }
+
+    func toggleFlash() {
+        if usesFrontCamera {
+            isFrontFlashOn.toggle()
+            Log.camera.info("Front flash \(self.isFrontFlashOn ? "on" : "off", privacy: .public)")
+        } else {
+            toggleTorch()
+        }
     }
 
     func toggleTorch() {
@@ -210,6 +226,9 @@ final class CameraManager {
     }
 
     private func apply(_ snapshot: PipelineSnapshot) {
+        if !snapshot.usesFrontCamera {
+            isFrontFlashOn = false
+        }
         usesFrontCamera = snapshot.usesFrontCamera
         zoomStops = snapshot.zoomStops
         displayZoom = snapshot.displayZoom

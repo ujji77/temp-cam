@@ -4,30 +4,34 @@ import UIKit
 struct TeleprompterOverlay: View {
     var model: TeleprompterManager
 
+    private let shape = RoundedRectangle(cornerRadius: 26, style: .continuous)
+
     var body: some View {
         ZStack {
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(Color.black.opacity(model.backgroundOpacity))
-                .shadow(color: .black.opacity(0.28), radius: 18, y: 10)
-
             TeleprompterScrollingText(model: model)
-                .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
-                .allowsHitTesting(false)
-
+                .clipShape(shape)
             readingGuide
         }
+        .background {
+            shape
+                .fill(.clear)
+                .glassEffect(.regular.tint(.black.opacity(model.backgroundOpacity)), in: shape)
+        }
+        // Taps on the script fall through to the camera preview, which owns the
+        // double-tap speed gesture. Only the controls below are interactive.
+        .allowsHitTesting(false)
         .overlay(alignment: .top) {
             statusRow
                 .padding(.top, 10)
         }
         .overlay(alignment: .bottomTrailing) {
-            TeleprompterPad(model: model)
-                .padding(8)
+            TeleprompterControl(model: model)
+                .padding(10)
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("Teleprompter")
-        .accessibilityValue(model.isPaused ? "Paused" : "Scrolling")
-        .accessibilityHint("Use the corner control to play or pause. Swipe up or down to change speed. Swipe left or right to change text size.")
+        .accessibilityValue(model.isPaused ? "Paused, \(model.speedLabel)" : "Scrolling, \(model.speedLabel)")
+        .accessibilityHint("Swipe up or down to scroll. Double-tap the right side of the screen to speed up, the left side to slow down.")
         .accessibilityAction(.default) {
             model.togglePause()
         }
@@ -41,39 +45,35 @@ struct TeleprompterOverlay: View {
 
     private var readingGuide: some View {
         GeometryReader { geo in
-            Rectangle()
-                .fill(Color.white.opacity(0.28))
-                .frame(height: 1)
-                .padding(.horizontal, 28)
-                .position(x: geo.size.width / 2, y: geo.size.height * 0.38)
+            Capsule()
+                .fill(CameraChrome.accent.opacity(0.55))
+                .frame(width: 3, height: 22)
+                .position(x: 10, y: geo.size.height * 0.38)
         }
         .allowsHitTesting(false)
     }
 
     @ViewBuilder
     private var statusRow: some View {
-        if model.showsHint {
-            Text("Swipe anywhere to adjust")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.white.opacity(0.78))
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(Color.black.opacity(0.35), in: Capsule())
-                .allowsHitTesting(false)
-        } else if model.isPaused {
-            HStack(spacing: 8) {
+        if model.isPaused, !model.isScrubbing {
+            HStack(spacing: 10) {
                 Text("Paused")
                     .font(.system(size: 13, weight: .semibold))
-                Button("Reset") {
+                    .foregroundStyle(.white.opacity(0.85))
+                Button {
+                    Haptics.tap()
                     model.resetToStart()
+                } label: {
+                    Label("Restart", systemImage: "arrow.counterclockwise")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(CameraChrome.accent)
                 }
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(CameraChrome.accent)
+                .buttonStyle(.plain)
             }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
-            .background(Color.black.opacity(0.55), in: Capsule())
+            .padding(.horizontal, 14)
+            .padding(.vertical, 7)
+            .glassEffect(.regular.tint(.black.opacity(0.25)), in: Capsule())
+            .transition(.opacity.combined(with: .scale(scale: 0.9)))
         }
     }
 }
@@ -82,7 +82,7 @@ private struct TeleprompterScrollingText: View {
     var model: TeleprompterManager
 
     var body: some View {
-        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: model.isPaused || !model.isActive)) { timeline in
+        TimelineView(.animation(minimumInterval: 1.0 / 60.0, paused: model.isPaused || model.isScrubbing || !model.isActive)) { timeline in
             TeleprompterCanvas(
                 text: model.script,
                 fontSize: CGFloat(model.fontSize),
@@ -92,7 +92,36 @@ private struct TeleprompterScrollingText: View {
             } onReachedEnd: {
                 model.pauseAtEnd()
             }
+            .overlay(alignment: .trailing) {
+                ScrollPositionIndicator(progress: model.progress(at: timeline.date))
+                    .padding(.vertical, 18)
+                    .padding(.trailing, 7)
+                    .opacity(model.isScrubbing ? 1 : 0)
+                    .animation(.easeOut(duration: model.isScrubbing ? 0.12 : 0.6), value: model.isScrubbing)
+            }
         }
+    }
+}
+
+/// Thin track on the teleprompter's edge that shows where you are while swiping.
+private struct ScrollPositionIndicator: View {
+    var progress: CGFloat
+
+    var body: some View {
+        GeometryReader { geo in
+            let thumb: CGFloat = 26
+            ZStack(alignment: .top) {
+                Capsule()
+                    .fill(.white.opacity(0.18))
+                    .frame(width: 3)
+                Capsule()
+                    .fill(.white)
+                    .frame(width: 3, height: thumb)
+                    .offset(y: (geo.size.height - thumb) * progress)
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .frame(width: 3)
     }
 }
 
@@ -118,50 +147,52 @@ private struct TeleprompterCanvas: UIViewRepresentable {
     }
 }
 
-struct TeleprompterPad: View {
+/// Compact glass control: tap the speed to see gesture hints, tap the button to play or pause.
+struct TeleprompterControl: View {
     var model: TeleprompterManager
 
     var body: some View {
-        ZStack {
-            Circle()
-                .fill(Color.black.opacity(0.55))
-                .overlay(Circle().strokeBorder(Color.white.opacity(0.18), lineWidth: 1))
-
-            directionArrow("chevron.up", direction: .up, x: 0, y: -27)
-            directionArrow("chevron.down", direction: .down, x: 0, y: 27)
-            directionArrow("chevron.left", direction: .left, x: -27, y: 0)
-            directionArrow("chevron.right", direction: .right, x: 27, y: 0)
-
-            Button {
-                Haptics.soft()
-                model.togglePause()
-            } label: {
-                Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
-                    .font(.system(size: 14, weight: .bold))
+        GlassEffectContainer(spacing: 6) {
+            HStack(spacing: 6) {
+                Button {
+                    Haptics.tap()
+                    model.showsHint ? model.dismissHints() : model.revealHints()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "gauge.with.needle.fill")
+                            .font(.system(size: 11, weight: .semibold))
+                        Text(model.speedLabel)
+                            .font(.system(size: 13, weight: .bold, design: .rounded).monospacedDigit())
+                            .contentTransition(.numericText(value: model.speed))
+                    }
                     .foregroundStyle(.white)
-                    .offset(x: model.isPaused ? 1 : 0)
-                    .frame(width: 34, height: 34)
-                    .background(Color.white.opacity(0.16), in: Circle())
-                    .contentShape(Circle())
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(model.isPaused ? "Play script" : "Pause script")
-        }
-        .frame(width: 88, height: 88)
-        .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
-        .animation(.easeOut(duration: 0.12), value: model.highlightedDirection)
-        .animation(.easeOut(duration: 0.12), value: model.isPaused)
-    }
+                    .padding(.horizontal, 11)
+                    .frame(height: 36)
+                    .contentShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.tint(.black.opacity(0.2)).interactive(), in: Capsule())
+                .accessibilityLabel("Speed \(model.speedLabel)")
+                .accessibilityHint("Shows gesture tips")
 
-    private func directionArrow(_ name: String, direction: TeleprompterDirection, x: CGFloat, y: CGFloat) -> some View {
-        let active = model.highlightedDirection == direction
-        return Image(systemName: name)
-            .font(.system(size: 11, weight: .bold))
-            .foregroundStyle(active ? CameraChrome.accent : Color.white.opacity(0.78))
-            .scaleEffect(active ? 1.18 : 1)
-            .offset(x: x, y: y)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
+                Button {
+                    Haptics.soft()
+                    model.togglePause()
+                } label: {
+                    Image(systemName: model.isPaused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 14, weight: .bold))
+                        .foregroundStyle(.white)
+                        .contentTransition(.symbolEffect(.replace))
+                        .frame(width: 36, height: 36)
+                        .contentShape(Circle())
+                }
+                .buttonStyle(.plain)
+                .glassEffect(.regular.tint(.black.opacity(0.2)).interactive(), in: Circle())
+                .accessibilityLabel(model.isPaused ? "Play script" : "Pause script")
+            }
+        }
+        .animation(.snappy(duration: 0.2), value: model.speed)
+        .animation(.snappy(duration: 0.2), value: model.isPaused)
     }
 }
 

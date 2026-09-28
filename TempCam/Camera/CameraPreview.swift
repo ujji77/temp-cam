@@ -7,6 +7,9 @@ struct CameraPreview: UIViewRepresentable {
     var configurationGeneration: Int
     var onFocus: (CGPoint) -> Void
     var onPinch: (_ scale: CGFloat, _ state: UIGestureRecognizer.State) -> Void
+    /// When set, double taps report which half of the screen was hit. Single-tap
+    /// focus then waits for the double tap to fail, so only enable it when needed.
+    var onDoubleTap: ((_ isTrailingHalf: Bool) -> Void)?
     var onPreviewLayer: (AVCaptureVideoPreviewLayer) -> Void
 
     func makeUIView(context: Context) -> CameraPreviewView {
@@ -15,12 +18,14 @@ struct CameraPreview: UIViewRepresentable {
         view.previewLayer.videoGravity = .resizeAspectFill
         view.onFocus = onFocus
         view.onPinch = onPinch
+        view.onDoubleTap = onDoubleTap
         return view
     }
 
     func updateUIView(_ view: CameraPreviewView, context: Context) {
         view.onFocus = onFocus
         view.onPinch = onPinch
+        view.onDoubleTap = onDoubleTap
         if view.previewLayer.session !== session {
             view.previewLayer.session = session
         }
@@ -41,7 +46,7 @@ struct CameraPreview: UIViewRepresentable {
     }
 }
 
-final class CameraPreviewView: UIView {
+final class CameraPreviewView: UIView, UIGestureRecognizerDelegate {
     override class var layerClass: AnyClass { AVCaptureVideoPreviewLayer.self }
 
     var previewLayer: AVCaptureVideoPreviewLayer {
@@ -50,15 +55,26 @@ final class CameraPreviewView: UIView {
 
     var onFocus: ((CGPoint) -> Void)?
     var onPinch: ((_ scale: CGFloat, _ state: UIGestureRecognizer.State) -> Void)?
+    var onDoubleTap: ((_ isTrailingHalf: Bool) -> Void)? {
+        didSet { doubleTap.isEnabled = onDoubleTap != nil }
+    }
 
     private let reticle = UIView()
+    private let doubleTap = UITapGestureRecognizer()
+    private let tap = UITapGestureRecognizer()
 
     override init(frame: CGRect) {
         super.init(frame: frame)
         backgroundColor = .black
         isMultipleTouchEnabled = true
 
-        let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
+        doubleTap.addTarget(self, action: #selector(handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        doubleTap.isEnabled = false
+        addGestureRecognizer(doubleTap)
+
+        tap.addTarget(self, action: #selector(handleTap(_:)))
+        tap.delegate = self
         addGestureRecognizer(tap)
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
@@ -82,6 +98,20 @@ final class CameraPreviewView: UIView {
         let devicePoint = previewLayer.captureDevicePointConverted(fromLayerPoint: point)
         onFocus?(devicePoint)
         showReticle(at: point)
+    }
+
+    /// Focus waits to see whether a tap becomes a double tap, but only while double
+    /// taps mean something. Otherwise focus stays instant.
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRequireFailureOf otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        gestureRecognizer === tap && otherGestureRecognizer === doubleTap && doubleTap.isEnabled
+    }
+
+    @objc private func handleDoubleTap(_ recognizer: UITapGestureRecognizer) {
+        let point = recognizer.location(in: self)
+        onDoubleTap?(point.x >= bounds.midX)
     }
 
     @objc private func handlePinch(_ recognizer: UIPinchGestureRecognizer) {

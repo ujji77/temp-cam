@@ -12,6 +12,8 @@ struct CameraScreen: View {
     @State private var teleprompter = TeleprompterManager()
     @State private var showSettings = false
     @State private var flipTurns = 0.0
+    @State private var screenLight = ScreenLight()
+    @AppStorage("camera.showsGrid") private var showsGrid = false
 
     var body: some View {
         GeometryReader { geo in
@@ -29,9 +31,21 @@ struct CameraScreen: View {
                     configurationGeneration: camera.configurationGeneration,
                     onFocus: { camera.focus(at: $0) },
                     onPinch: { camera.handlePinch(scale: $0, state: $1) },
+                    onDoubleTap: teleprompter.isActive && !showSettings ? { isTrailing in
+                        handleDoubleTap(isTrailing: isTrailing)
+                    } : nil,
                     onPreviewLayer: { camera.attachPreviewLayer($0) }
                 )
                 .ignoresSafeArea()
+
+                if showsGrid {
+                    GridOverlay()
+                        .transition(.opacity)
+                }
+                if camera.isFrontFlashOn {
+                    FrontFlashRing()
+                        .transition(.opacity)
+                }
 
                 if camera.authorization == .denied || camera.authorization == .restricted {
                     permissionView(canOpenSettings: true, message: "TempCam needs the camera and microphone to record. Scripts stay in memory only until you close the app.")
@@ -49,10 +63,20 @@ struct CameraScreen: View {
                     }
                     .ignoresSafeArea()
                     .allowsHitTesting(false)
+                    // Don't dim the bottom edge of the ring light.
+                    .opacity(camera.isFrontFlashOn ? 0 : 1)
 
                     chrome(scriptHeight: scriptHeight)
+
+                    if let pulse = teleprompter.speedPulse {
+                        SpeedPulseView(pulse: pulse)
+                            .transition(.opacity)
+                    }
                 }
             }
+            .animation(.easeOut(duration: 0.2), value: teleprompter.speedPulse)
+            .animation(.easeInOut(duration: 0.2), value: showsGrid)
+            .animation(.easeInOut(duration: 0.25), value: camera.isFrontFlashOn)
         }
         .background(Color.black.ignoresSafeArea())
         .sheet(isPresented: $showSettings) {
@@ -64,15 +88,20 @@ struct CameraScreen: View {
             }
             await camera.prepare()
         }
+        .onChange(of: camera.isFrontFlashOn) { _, on in
+            screenLight.setOn(on)
+        }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .active:
                 camera.setInterfaceActive(true)
+                screenLight.setOn(camera.isFrontFlashOn)
             case .background:
                 teleprompter.pauseForBackground()
                 camera.setInterfaceActive(false)
+                screenLight.setOn(false)
             default:
-                break
+                screenLight.setOn(false)
             }
         }
     }
@@ -90,6 +119,11 @@ struct CameraScreen: View {
                     .padding(.horizontal, 12)
                     .transition(.opacity)
             }
+            if teleprompter.showsHint {
+                TeleprompterGestureHints { teleprompter.dismissHints() }
+                    .padding(.top, 8)
+                    .transition(.opacity.combined(with: .scale(scale: 0.96)))
+            }
             Spacer(minLength: 0)
             zoomBar
                 .opacity(camera.isRecording ? 0 : 1)
@@ -98,20 +132,7 @@ struct CameraScreen: View {
         }
         .padding(.top, 6)
         .padding(.bottom, 8)
-        .overlay(alignment: .bottom) {
-            if let hudText = teleprompter.hudText {
-                Text(hudText)
-                    .font(.system(size: 16, weight: .semibold, design: .rounded).monospacedDigit())
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(.ultraThinMaterial, in: Capsule())
-                    .padding(.bottom, 148)
-                    .transition(.opacity.combined(with: .scale(scale: 0.94)))
-                    .allowsHitTesting(false)
-            }
-        }
-        .animation(.easeOut(duration: 0.18), value: teleprompter.hudText)
+        .animation(.easeInOut(duration: 0.25), value: teleprompter.showsHint)
         .animation(.easeInOut(duration: 0.22), value: teleprompter.isActive)
         .animation(.easeInOut(duration: 0.2), value: camera.isRecording)
         .animation(.easeInOut(duration: 0.2), value: camera.notice)
@@ -121,46 +142,86 @@ struct CameraScreen: View {
         ZStack {
             RecordingTimer(camera: camera)
             HStack {
-                torchButton
-                    .opacity(camera.isRecording ? 0 : 1)
-                    .allowsHitTesting(!camera.isRecording)
+                GlassEffectContainer(spacing: 10) {
+                    HStack(spacing: 10) {
+                        if camera.isFlashAvailable, !camera.isRecording {
+                            flashButton
+                                .transition(.opacity.combined(with: .scale(scale: 0.8)))
+                        }
+                        gridButton
+                    }
+                }
                 Spacer()
                 teleprompterButton
             }
         }
         .padding(.horizontal, 18)
+        .animation(.snappy(duration: 0.22), value: camera.isFlashAvailable)
     }
 
-    private var torchButton: some View {
-        Button {
-            Haptics.tap()
-            camera.toggleTorch()
-        } label: {
-            Image(systemName: camera.isTorchOn ? "bolt.fill" : "bolt.slash.fill")
-                .font(.system(size: 20, weight: .medium))
-                .foregroundStyle(camera.isTorchOn ? CameraChrome.accent : .white)
-                .frame(width: 44, height: 44)
-                .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+    private var flashButton: some View {
+        glassButton(
+            systemImage: camera.isFlashOn ? "bolt.fill" : "bolt.slash.fill",
+            isOn: camera.isFlashOn,
+            label: camera.usesFrontCamera
+                ? (camera.isFlashOn ? "Turn front flash off" : "Turn front flash on")
+                : (camera.isFlashOn ? "Turn flash off" : "Turn flash on")
+        ) {
+            camera.toggleFlash()
         }
-        .buttonStyle(.plain)
-        .opacity(camera.isTorchAvailable ? 1 : 0)
-        .allowsHitTesting(camera.isTorchAvailable)
-        .accessibilityLabel(camera.isTorchOn ? "Turn torch off" : "Turn torch on")
+    }
+
+    private var gridButton: some View {
+        glassButton(
+            systemImage: "squareshape.split.3x3",
+            isOn: showsGrid,
+            label: showsGrid ? "Hide grid" : "Show grid"
+        ) {
+            showsGrid.toggle()
+        }
     }
 
     private var teleprompterButton: some View {
+        glassButton(
+            systemImage: "text.viewfinder",
+            isOn: teleprompter.isActive,
+            label: "Teleprompter"
+        ) {
+            showSettings = true
+        }
+    }
+
+    private func glassButton(
+        systemImage: String,
+        isOn: Bool,
+        label: String,
+        action: @escaping () -> Void
+    ) -> some View {
         Button {
             Haptics.tap()
-            showSettings = true
+            action()
         } label: {
-            Image(systemName: "text.viewfinder")
-                .font(.system(size: 22, weight: .medium))
-                .foregroundStyle(teleprompter.isActive ? CameraChrome.accent : .white)
+            Image(systemName: systemImage)
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(isOn ? CameraChrome.accent : .white)
+                .contentTransition(.symbolEffect(.replace))
                 .frame(width: 44, height: 44)
-                .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Teleprompter")
+        .glassEffect(.regular.tint(.black.opacity(0.15)).interactive(), in: Circle())
+        .accessibilityLabel(label)
+        .accessibilityAddTraits(isOn ? .isSelected : [])
+    }
+
+    private func handleDoubleTap(isTrailing: Bool) {
+        let before = teleprompter.speed
+        teleprompter.stepSpeed(from: isTrailing ? .trailing : .leading)
+        if teleprompter.speed == before {
+            Haptics.limit()
+        } else {
+            Haptics.soft()
+        }
     }
 
     private var zoomBar: some View {
@@ -176,9 +237,10 @@ struct CameraScreen: View {
                         .font(.system(size: selected ? 13 : 12, weight: .semibold).monospacedDigit())
                         .foregroundStyle(selected ? CameraChrome.accent : .white)
                         .frame(width: selected ? 42 : 34, height: selected ? 42 : 34)
-                        .background(Color.black.opacity(0.42), in: Circle())
+                        .contentShape(Circle())
                 }
                 .buttonStyle(.plain)
+                .glassEffect(.regular.tint(.black.opacity(0.2)).interactive(), in: Circle())
                 .accessibilityLabel("\(formatZoom(stop.displayZoom)) times zoom")
             }
         }
@@ -235,9 +297,10 @@ struct CameraScreen: View {
                 .foregroundStyle(.white)
                 .rotationEffect(.degrees(flipTurns))
                 .frame(width: 52, height: 52)
-                .shadow(color: .black.opacity(0.45), radius: 3, y: 1)
+                .contentShape(Circle())
         }
         .buttonStyle(.plain)
+        .glassEffect(.regular.tint(.black.opacity(0.15)).interactive(), in: Circle())
         .opacity(camera.isRecording ? 0 : 1)
         .allowsHitTesting(!camera.isRecording)
         .animation(.easeInOut(duration: 0.35), value: flipTurns)
@@ -353,5 +416,9 @@ enum Haptics {
 
     static func soft() {
         UIImpactFeedbackGenerator(style: .soft).impactOccurred()
+    }
+
+    static func limit() {
+        UINotificationFeedbackGenerator().notificationOccurred(.warning)
     }
 }

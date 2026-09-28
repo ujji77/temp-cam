@@ -1,7 +1,22 @@
 import SwiftUI
 import UIKit
 
-/// In-memory teleprompter state. Nothing here is written to disk.
+/// Which half of the screen a double tap landed on.
+enum TeleprompterSide: Equatable {
+    case leading, trailing
+}
+
+/// Feedback shown after a double tap changes speed. `id` changes on every tap so
+/// repeated taps at the same speed (e.g. at the limit) still animate.
+struct SpeedPulse: Equatable {
+    var side: TeleprompterSide
+    var speed: Double
+    var hitLimit: Bool
+    var id: Int
+}
+
+/// In-memory teleprompter state. The script is never written to disk; only the
+/// number of times the gesture hints have been shown is kept in `UserDefaults`.
 @MainActor
 @Observable
 final class TeleprompterManager {
@@ -12,25 +27,28 @@ final class TeleprompterManager {
     var fontSize = 30.0
     var backgroundOpacity = 0.4
     var scrollOffset: CGFloat = 0
-    var hudText: String?
     var showsHint = false
-    var highlightedDirection: TeleprompterDirection?
+    private(set) var isScrubbing = false
+    private(set) var speedPulse: SpeedPulse?
 
     private(set) var contentHeight: CGFloat = 0
     private(set) var viewportHeight: CGFloat = 1
     private var segmentStart = Date()
     private var segmentBase: CGFloat = 0
-    private var gestureOriginSpeed = 1.0
-    private var gestureOriginFont = 30.0
-    private var lockedAxis: Axis?
-    private var fontAnchorFraction: CGFloat?
+    private var scrubOrigin: CGFloat = 0
+    private var pulseCount = 0
 
-    static let minimumSpeed = 0.3
-    static let maximumSpeed = 2.6
+    static let minimumSpeed = 0.2
+    static let maximumSpeed = 3.0
+    /// How much one double tap changes speed.
+    static let speedStep = 0.2
     static let minimumFontSize = 20.0
     static let maximumFontSize = 48.0
     /// Points per second at 1×. A calm speaking pace at the default text size.
     static let basePointsPerSecond = 34.0
+    /// Gesture hints appear automatically for the first few scripts, then only on request.
+    static let automaticHintLimit = 3
+    static let hintCountKey = "teleprompter.hintsShown"
 
     var pointsPerSecond: Double { speed * Self.basePointsPerSecond }
 
@@ -42,12 +60,23 @@ final class TeleprompterManager {
         !script.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var hudTask: Task<Void, Never>?
-    private var hintTask: Task<Void, Never>?
+    /// 0...1 position through the script, for the scroll indicator.
+    func progress(at date: Date) -> CGFloat {
+        guard contentHeight > 1 else { return 0 }
+        return min(max(offset(at: date) / contentHeight, 0), 1)
+    }
+
+    @ObservationIgnored private let defaults: UserDefaults
+    @ObservationIgnored private var pulseTask: Task<Void, Never>?
+    @ObservationIgnored private var hintTask: Task<Void, Never>?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
 
     func offset(at date: Date) -> CGFloat {
         let limit = contentHeight > 1 ? contentHeight : .greatestFiniteMagnitude
-        guard isActive, !isPaused else { return min(segmentBase, limit) }
+        guard isActive, !isPaused, !isScrubbing else { return min(segmentBase, limit) }
         let elapsed = date.timeIntervalSince(segmentStart)
         let value = segmentBase + CGFloat(max(0, elapsed) * pointsPerSecond)
         return min(max(0, value), limit)
@@ -60,33 +89,48 @@ final class TeleprompterManager {
         scrollOffset = 0
         isActive = true
         isPaused = false
+        let shown = defaults.integer(forKey: Self.hintCountKey)
+        if shown < Self.automaticHintLimit {
+            defaults.set(shown + 1, forKey: Self.hintCountKey)
+            revealHints()
+        }
+    }
+
+    /// Shows the gesture hints on demand (tapping the speed readout).
+    func revealHints() {
+        guard isActive else { return }
         showsHint = true
         hintTask?.cancel()
         hintTask = Task {
-            try? await Task.sleep(for: .seconds(2.8))
+            try? await Task.sleep(for: .seconds(4))
             guard !Task.isCancelled else { return }
             showsHint = false
         }
     }
 
+    func dismissHints() {
+        hintTask?.cancel()
+        showsHint = false
+    }
+
     /// Drops the script. Called when a recording finishes, and from the sheet.
     func discard() {
         hintTask?.cancel()
-        hudTask?.cancel()
+        pulseTask?.cancel()
         script = ""
         isActive = false
         isPaused = true
+        isScrubbing = false
         segmentBase = 0
         scrollOffset = 0
         showsHint = false
-        hudText = nil
-        highlightedDirection = nil
+        speedPulse = nil
         contentHeight = 0
     }
 
     func togglePause() {
         guard isActive else { return }
-        showsHint = false
+        dismissHints()
         if isPaused {
             if contentHeight > 1, segmentBase >= contentHeight - 1 {
                 resetToStart()
@@ -106,7 +150,7 @@ final class TeleprompterManager {
         segmentStart = .now
         scrollOffset = 0
         isPaused = false
-        showsHint = false
+        dismissHints()
     }
 
     func pauseForBackground() {
@@ -115,86 +159,83 @@ final class TeleprompterManager {
         isPaused = true
     }
 
-    func setSpeed(from origin: Double, translation: CGFloat) {
-        let frozen = offset(at: .now)
-        let delta = -Double(translation) / 160
-        speed = min(Self.maximumSpeed, max(Self.minimumSpeed, origin + delta))
-        segmentBase = frozen
-        segmentStart = .now
-        revealHUD(speedLabel)
-        showsHint = false
-    }
-
-    func setFontSize(from origin: Double, translation: CGFloat) {
-        fontSize = min(Self.maximumFontSize, max(Self.minimumFontSize, origin + Double(translation) / 6))
-        revealHUD("\(Int(fontSize.rounded()))")
-        showsHint = false
-    }
-
+    /// Vertical swipes move the script like a scroll view: swipe up to read ahead,
+    /// down to go back. Auto-scroll holds while the finger is down and resumes
+    /// from the new position on release.
     func handleSwipe(translation: CGPoint, state: UIGestureRecognizer.State) {
         guard isActive else { return }
         switch state {
         case .began:
-            gestureOriginSpeed = speed
-            gestureOriginFont = fontSize
-            lockedAxis = nil
-            fontAnchorFraction = nil
-            showsHint = false
+            scrubOrigin = offset(at: .now)
+            segmentBase = scrubOrigin
+            isScrubbing = true
+            dismissHints()
         case .changed:
-            let dx = translation.x
-            let dy = translation.y
-            if lockedAxis == nil {
-                guard max(abs(dx), abs(dy)) > 14 else { return }
-                lockedAxis = abs(dy) >= abs(dx) ? .vertical : .horizontal
-                if lockedAxis == .horizontal {
-                    fontAnchorFraction = contentHeight > 1 ? offset(at: .now) / contentHeight : 0
-                }
-            }
-            if lockedAxis == .vertical {
-                setSpeed(from: gestureOriginSpeed, translation: dy)
-                highlightedDirection = dy < 0 ? .up : .down
-            } else {
-                setFontSize(from: gestureOriginFont, translation: dx)
-                highlightedDirection = dx >= 0 ? .right : .left
-            }
+            guard isScrubbing else { return }
+            scrub(to: scrubOrigin - translation.y)
         default:
-            highlightedDirection = nil
-            lockedAxis = nil
+            guard isScrubbing else { return }
+            isScrubbing = false
+            segmentStart = .now
+        }
+    }
+
+    private func scrub(to value: CGFloat) {
+        let limit = contentHeight > 1 ? contentHeight : 0
+        segmentBase = min(max(0, value), limit)
+        scrollOffset = segmentBase
+    }
+
+    /// Double tap on the trailing half speeds up, leading half slows down.
+    func stepSpeed(from side: TeleprompterSide) {
+        guard isActive else { return }
+        let delta = side == .trailing ? Self.speedStep : -Self.speedStep
+        let changed = changeSpeed(by: delta)
+        dismissHints()
+        pulseCount += 1
+        speedPulse = SpeedPulse(side: side, speed: speed, hitLimit: !changed, id: pulseCount)
+        pulseTask?.cancel()
+        pulseTask = Task {
+            try? await Task.sleep(for: .milliseconds(900))
+            guard !Task.isCancelled else { return }
+            speedPulse = nil
         }
     }
 
     func nudgeSpeed(_ direction: AccessibilityAdjustmentDirection) {
-        let frozen = offset(at: .now)
-        let step = 0.1
         switch direction {
         case .increment:
-            speed = min(Self.maximumSpeed, speed + step)
+            changeSpeed(by: Self.speedStep)
         case .decrement:
-            speed = max(Self.minimumSpeed, speed - step)
+            changeSpeed(by: -Self.speedStep)
         @unknown default:
             break
         }
+    }
+
+    /// Returns false when already at the limit in that direction.
+    @discardableResult
+    private func changeSpeed(by delta: Double) -> Bool {
+        let target = ((speed + delta) * 10).rounded() / 10
+        let clamped = min(Self.maximumSpeed, max(Self.minimumSpeed, target))
+        guard abs(clamped - speed) > 0.001 else { return false }
+        let frozen = offset(at: .now)
+        speed = clamped
         segmentBase = frozen
         segmentStart = .now
-        revealHUD(speedLabel)
+        return true
     }
 
     func pauseAtEnd() {
-        guard isActive, !isPaused, contentHeight > 1 else { return }
+        guard isActive, !isPaused, !isScrubbing, contentHeight > 1 else { return }
         segmentBase = contentHeight
         scrollOffset = contentHeight
         isPaused = true
     }
 
     func updateMetrics(contentHeight: CGFloat, viewportHeight: CGFloat) {
-        let heightChanged = abs(self.contentHeight - contentHeight) > 0.5
-        if heightChanged {
+        if abs(self.contentHeight - contentHeight) > 0.5 {
             self.contentHeight = contentHeight
-            if let fontAnchorFraction {
-                let anchored = min(max(0, fontAnchorFraction * contentHeight), contentHeight)
-                segmentBase = anchored
-                segmentStart = .now
-            }
         }
         if viewportHeight > 1, abs(self.viewportHeight - viewportHeight) > 0.5 {
             self.viewportHeight = viewportHeight
@@ -209,18 +250,4 @@ final class TeleprompterManager {
         script = text
         return true
     }
-
-    private func revealHUD(_ text: String) {
-        hudText = text
-        hudTask?.cancel()
-        hudTask = Task {
-            try? await Task.sleep(for: .milliseconds(900))
-            guard !Task.isCancelled else { return }
-            hudText = nil
-        }
-    }
-}
-
-enum TeleprompterDirection: Equatable {
-    case up, down, left, right
 }
